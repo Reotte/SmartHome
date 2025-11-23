@@ -1,0 +1,157 @@
+substitutions:
+  name: "Living Room"
+
+esphome:
+  name: air-quality-livingroom
+
+esp8266:
+  board: d1_mini
+
+# Enable logging
+logger:
+  logs:
+    sensor: none
+    binary_sensor: none
+    homeassistant.binary_sensor: none
+    pm1006: none
+    ccs811: none
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: ""
+
+ota:
+  - platform: esphome
+    password: ""
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  ## Serial Port for the IKEA Sensor
+uart:
+  - rx_pin: D7
+    # tx_pin: D8
+    baud_rate: 9600
+
+i2c:
+  ## I²C Port - For Temp/Humidity/Pressure & CO²/VOC Sensors
+  scl: D1
+  sda: D2
+  scan: true
+  id: bus_a
+
+binary_sensor:  
+  ## Use the on-board LED to show "Fan Running"
+  - platform: gpio
+    name: "Fan"
+    id: fan
+    pin:
+      number: D4
+      inverted: true
+
+  ## Brightness Sensor for HA Automations
+  - platform: template
+    name: "Bright"
+    id: bright
+
+sensor:
+  ## IKEA PMS 2.5µg Sensor
+  - platform: pm1006
+    id: aq_sensor
+    pm_2_5:
+      name: "2.5µg"
+
+  ## SHT31 Temp/Humidity Sensor Raw
+  - platform: sht3xd
+    temperature:
+      name: "Temperature Raw"
+      id: sht_temp_raw
+    humidity:
+      name: Humidity Raw
+      id: sht_humi_raw
+    address: 0x44
+    update_interval: 30s
+
+  ## SHT31 Temp/Humidity Sensor Corrected with linear offset
+  - platform: sht3xd
+    temperature:
+      name: "Temperature"
+      id: sht_temp_corr
+      filters:
+        - calibrate_linear:
+            - 27.5 -> 23.5
+            - 30.0 -> 27.0 # to be fixed, not real data
+    address: 0x44
+    update_interval: 30s
+
+  ## Corrected humidity from corrected temperature using Magnus formula
+  - platform: template
+    name: "Humidity"
+    id: sht_humi_corr
+    unit_of_measurement: "%"
+    update_interval: 30s
+    lambda: |-
+      if (isnan(id(sht_humi_raw).state) || isnan(id(sht_temp_raw).state) || isnan(id(sht_temp_corr).state)) return NAN;
+      // Magnus constants for water over liquid, temperature in °C
+      const float a = 17.62;
+      const float b = 243.12;
+      float Tm = id(sht_temp_raw).state;
+      float Tc = id(sht_temp_corr).state;
+      float RHm = id(sht_humi_raw).state;
+
+      // Saturation vapor pressure at measured temp (hPa)
+      float es_m = 6.112 * exp((a * Tm) / (b + Tm));
+      // Actual vapor pressure from measured RH
+      float e = (RHm / 100.0f) * es_m;
+      // Saturation vapor pressure at corrected temp
+      float es_c = 6.112 * exp((a * Tc) / (b + Tc));
+      // Corrected RH
+      float RHc = 100.0f * (e / es_c);
+      // Clamp to [0, 100]
+      if (RHc < 0) RHc = 0;
+      if (RHc > 100) RHc = 100;
+      return RHc;
+
+ # Dew point (helps sanity-check humidity/temperature pairing)
+  - platform: template
+    name: "Dew Point"
+    id: dew_point
+    unit_of_measurement: "°C"
+    update_interval: 30s
+    lambda: |-
+      if (isnan(id(sht_humi_corr).state) || isnan(id(sht_temp_corr).state)) return NAN;
+      const float a = 17.62;
+      const float b = 243.12;
+      float T = id(sht_temp_corr).state;
+      float RH = id(sht_humi_corr).state;
+      float gamma = (a * T) / (b + T) + log(RH / 100.0f);
+      return (b * gamma) / (a - gamma);
+
+  - platform: template
+    name: "Heat Index"
+    unit_of_measurement: "°C"
+    lambda: |-
+      if (isnan(id(sht_temp_corr).state) || isnan(id(sht_humi_corr).state)) return NAN;
+      float T = id(sht_temp_corr).state;
+      float RH = id(sht_humi_corr).state;
+      // Simplified heat index formula
+      return -8.784695 + 1.61139411*T + 2.338549*RH
+             - 0.14611605*T*RH - 0.012308094*pow(T,2)
+             - 0.016424828*pow(RH,2) + 0.002211732*pow(T,2)*RH
+             + 0.00072546*T*pow(RH,2) - 0.000003582*pow(T,2)*pow(RH,2);
+
+  ## The IKEA Light Level Sensor
+  - platform: adc
+    id: light_sensor
+    name: "Light"
+    pin: A0
+    update_interval: 1s
+    on_value:
+      - lambda: !lambda |
+          if (x > 0.01) {
+            id(bright).publish_state(true);
+            } else {
+              id(bright).publish_state(false);
+              }
